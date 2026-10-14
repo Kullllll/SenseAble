@@ -1,6 +1,7 @@
 """Gemma 4 26B A4B IT webcam alerts through 9Router.
 
 Install: pip install opencv-python requests
+Audio on Ubuntu: sudo apt install espeak-ng
 Start 9Router first, then:
   export NINEROUTER_API_KEY="your-dashboard-api-key"
   python gemma_9router_warning.py --list-models
@@ -8,13 +9,17 @@ Start 9Router first, then:
 
 If --model is omitted, select Gemma 4 26B A4B IT only when its ID is
 unambiguous in /v1/models. Images are sent to the configured provider.
-Q / Esc exits. No depth estimation or audio output is included.
-stdout contains alerts only; diagnostics go to stderr.
+Q / Esc exits. Vietnamese audio is enabled by default; --no-audio disables it.
+No depth estimation is included.
+stdout contains fixed Vietnamese alerts only. --debug writes detection JSON
+and timing to stderr. Errors always go to stderr.
 """
 import argparse
 import base64
 import json
 import os
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -49,7 +54,7 @@ def parse_answer(raw):
 
 
 class AlertGate:
-    """Suppress repeats; two clear observations rearm, uncertainty does not."""
+    """Emit a clear message once after two fresh none observations."""
     def __init__(self):
         self.position = None
         self.last_emitted = float("-inf")
@@ -61,8 +66,10 @@ class AlertGate:
             return None
         if answer == "none":
             self.clear_count += 1
-            if self.clear_count >= 2:
-                self.position = None
+            if self.clear_count >= 2 and self.position != "none":
+                self.position = "none"
+                self.last_emitted = now
+                return {"object": False, "position": None}
             return None
         self.clear_count = 0
         if answer != self.position or now - self.last_emitted >= REPEAT_ALERT_S:
@@ -72,8 +79,98 @@ class AlertGate:
         return None
 
 
+def warning_text(answer):
+    """Map validated observations to three fixed Vietnamese phrases."""
+    if answer == "none":
+        return "Không có vật cản"
+    if answer not in VALID_OBSTACLES:
+        return None
+    return "Có người phía trước" if answer.split()[0] == "person" else "Có vật cản phía trước"
+
+
+def detection_debug(answer, raw, elapsed, age, emitted):
+    detected = answer in VALID_OBSTACLES
+    obj, position = answer.split() if detected else (None, None)
+    return {"object": obj, "position": position,
+            "detected": True if detected else (False if answer == "none" else None),
+            "status": answer if not detected else "obstacle",
+            "raw": raw[:200], "process_s": round(elapsed, 3),
+            "age_s": round(age, 3), "stale": age > MAX_RESULT_AGE_S,
+            "alert_emitted": emitted}
+
+
 def log(message):
     print(message, file=sys.stderr, flush=True)
+
+
+class AudioSpeaker:
+    """One speech process at a time; retain only the latest pending phrase."""
+    PHRASES = {"Có người phía trước", "Có vật cản phía trước", "Không có vật cản"}
+
+    def __init__(self, enabled=True):
+        self.condition = threading.Condition()
+        self.pending = None
+        self.process = None
+        self.stopped = False
+        self.thread = None
+        self.command = shutil.which("espeak-ng") if enabled else None
+        if enabled and self.command is None:
+            log("Chưa có giọng đọc. Cài: sudo apt install espeak-ng. "
+                "Chương trình vẫn chạy với đầu ra text.")
+        if self.command:
+            self.thread = threading.Thread(target=self._run, name="vietnamese-audio")
+            self.thread.start()
+
+    def say(self, text, captured):
+        if self.command and text in self.PHRASES:
+            with self.condition:
+                if not self.stopped:
+                    self.pending = (text, captured + MAX_RESULT_AGE_S)
+                    self.condition.notify()
+
+    def cancel_pending(self):
+        with self.condition:
+            self.pending = None
+
+    def _run(self):
+        while True:
+            with self.condition:
+                self.condition.wait_for(lambda: self.stopped or self.pending is not None)
+                if self.stopped:
+                    return
+                text, deadline = self.pending
+                self.pending = None
+                if time.perf_counter() > deadline:
+                    continue
+                try:
+                    self.process = subprocess.Popen(
+                        [self.command, "-v", "vi", "-s", "165", "-a", "100", text],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    process = self.process
+                except OSError as exc:
+                    log(f"Không phát được âm thanh: {exc}")
+                    continue
+            try:
+                code = process.wait(timeout=8)
+                if code and not self.stopped:
+                    log("Giọng đọc lỗi. Thử espeak-ng -v vi 'Có người phía trước' trong Terminal.")
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                log("Đã dừng lượt phát âm thanh quá thời gian.")
+            finally:
+                with self.condition:
+                    self.process = None
+
+    def close(self):
+        with self.condition:
+            self.stopped = True
+            self.pending = None
+            if self.process is not None and self.process.poll() is None:
+                self.process.terminate()
+            self.condition.notify_all()
+        if self.thread is not None:
+            self.thread.join()
 
 
 class RouterClient:
@@ -144,7 +241,8 @@ def positive_float(value):
 
 def main():
     parser = argparse.ArgumentParser(description="Gemma via 9Router person/table/chair obstacle alerts")
-    parser.add_argument("--debug", action="store_true", help="Show raw responses on stderr")
+    parser.add_argument("--debug", action="store_true", help="Show object, position, raw response and timing on stderr")
+    parser.add_argument("--no-audio", action="store_true", help="Disable Vietnamese speech")
     parser.add_argument("--base-url", default=os.getenv("NINEROUTER_BASE_URL", BASE_URL))
     parser.add_argument("--model", default=os.getenv("NINEROUTER_MODEL"),
                         help="Exact model ID or combo configured in 9Router")
@@ -177,7 +275,8 @@ def main():
         log(f"Không kết nối/chọn được model: {exc}")
         client.close()
         return 1
-    log(f"9Router: {client.base_url} | Model: {args.model}")
+    if args.debug:
+        log(f"9Router: {client.base_url} | Model: {args.model}")
 
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
@@ -188,6 +287,7 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
 
+    speaker = AudioSpeaker(enabled=not args.no_audio)
     stop = threading.Event()
     condition = threading.Condition()
     # One slot: camera replaces old frames, never queues them for inference.
@@ -199,7 +299,8 @@ def main():
         last_sequence = -1
         next_request = 0.0
         failures = 0
-        log("Sẵn sàng. Chỉ cảnh báo người/bàn/ghế cản lối đi; Q / Esc để thoát.")
+        if args.debug:
+            log("Sẵn sàng. Chỉ cảnh báo người/bàn/ghế cản lối đi; Q / Esc để thoát.")
         try:
             while not stop.is_set():
                 if stop.wait(max(0.0, next_request - time.perf_counter())):
@@ -228,13 +329,18 @@ def main():
                             "elapsed": finished - started,
                             "preview": cv2.resize(frame, (192, 144))}
                         state["status"] = "Running"
+                    speaker.cancel_pending()
                     alert = gate.update(answer, age, finished)
                     if alert is not None:
-                        print(json.dumps(alert, separators=(",", ":")), flush=True)
+                        text = warning_text(answer)
+                        print(text, flush=True)
+                        speaker.say(text, captured)
                     if args.debug:
-                        log(f"raw={raw[:200]!r} parsed={answer} "
-                            f"process={finished-started:.2f}s age={age:.2f}s")
+                        log(json.dumps(detection_debug(answer, raw, finished - started,
+                                                       age, alert is not None),
+                                       ensure_ascii=False, separators=(",", ":")))
                 except (requests.RequestException, RuntimeError, ValueError, KeyError, TypeError) as exc:
+                    speaker.cancel_pending()
                     gate.update("unknown", 0, time.perf_counter())
                     failures += 1
                     delay = min(30.0, 2.0 ** min(failures, 5))
@@ -252,7 +358,8 @@ def main():
 
     thread = threading.Thread(target=worker, name="gemma-api")
     thread.start()
-    log("Webcam chạy liên tục. Đang kết nối Gemma qua 9Router...")
+    if args.debug:
+        log("Webcam chạy liên tục. Đang kết nối Gemma qua 9Router...")
     try:
         while True:
             ret, frame = cap.read()
@@ -307,14 +414,16 @@ def main():
         pass
     finally:
         stop.set()
+        speaker.close()
         with condition:
             condition.notify_all()
         cap.release()
         cv2.destroyAllWindows()
-        if thread.is_alive():
+        if thread.is_alive() and args.debug:
             log("Đang chờ yêu cầu API hiện tại kết thúc (hoặc timeout)...")
         thread.join()
-        log("Đã thoát.")
+        if args.debug:
+            log("Đã thoát.")
     return 1 if state["fatal"] else 0
 
 
